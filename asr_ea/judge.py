@@ -4,6 +4,13 @@ Gets the story, question, reference transcript and ASR output (not the run name)
 broader category, subtype, secondary subtype, meaning_changed and a short reason. Labels outside the
 definitions tab are sent back once; anything still invalid is saved with llm_label_valid = N.
 
+The empty-transcript rules (taxonomy D1, agreed 2026-10-16) are also checked in code, not only in the prompt:
+- reference empty, ASR not empty -> broader must be "Hallucination"
+- reference not empty, ASR empty -> broader must be "No output"
+- both not empty                 -> "Hallucination" is not allowed
+- ASR not empty                  -> "No output" is not allowed
+An answer that breaks one is sent back once with the reason, like an unknown label.
+
 Providers: openai, azure, openai_compatible (a gateway with its own URL), vllm_server, anthropic.
 """
 import datetime
@@ -181,8 +188,25 @@ def parse(raw):
     return json.loads(m.group(0) if m else t)
 
 
-def evaluate(L, jc, version, pair_id, raw):
-    """-> (record for llm_labels, is_valid, description of the bad labels)"""
+def rule_problem(broader, ref, asr):
+    """'' if the broader category fits the empty-transcript rules, else the reason it doesn't."""
+    ref_empty, asr_empty = not clean_text(ref), not clean_text(asr)
+    b = clean_text(broader).lower()
+    if ref_empty and not asr_empty and b != "hallucination":
+        return ('the reference is empty (the child said nothing) and the ASR output is not, '
+                'so the broader category must be "Hallucination"')
+    if not ref_empty and asr_empty and b != "no output":
+        return 'the ASR output is empty but the reference is not, so the category must be "No output"'
+    if not asr_empty and b == "no output":
+        return 'the ASR output is not empty, so "No output" is not allowed'
+    if not ref_empty and not asr_empty and b == "hallucination":
+        return ('the child spoke (the reference is not empty), so "Hallucination" is not allowed; '
+                "label what the ASR did to the child's words")
+    return ""
+
+
+def evaluate(L, jc, version, pair_id, raw, ref="", asr=""):
+    """-> (record for llm_labels, is_valid, description of the problem)"""
     try:
         out = parse(raw)
         out = out if isinstance(out, dict) else {}
@@ -194,7 +218,12 @@ def evaluate(L, jc, version, pair_id, raw):
         {"broader": "b", "primary": "p", "secondary": "s", "meaning": "m"})
     lab = labels.iloc[0]
     valid = bool(lab.primary) and not len(probs)
-    bad = ", ".join(f"{p['column']}={p['label']!r}" for _, p in probs.iterrows()) or "no valid JSON/primary"
+    if valid:
+        bad = rule_problem(lab.broader, ref, asr)
+        valid = not bad
+    else:
+        bad = ("labels that aren't in the list: "
+               + (", ".join(f"{p['column']}={p['label']!r}" for _, p in probs.iterrows()) or "no valid JSON/primary"))
     rec = {"pair_id": pair_id,
            "llm_broader": lab.broader or clean_text(out.get("broader", "")),
            "llm_cat_primary": lab.primary or clean_text(out.get("primary", "")),
@@ -256,18 +285,20 @@ def run(ctx):
                 f"Reference transcript: {show_text(r['reference_text'])}\n"
                 f"ASR output: {show_text(r['asr_output'])}")
 
-    results = []
+    results, n_rule_fixed = [], 0
     for start in range(0, len(items), jc["batch_size"]):
         batch = items.iloc[start:start + jc["batch_size"]]
         users = [user_message(r) for _, r in batch.iterrows()]
-        evals = [evaluate(L, jc, version, pid, raw)
-                 for pid, raw in zip(batch.pair_id, judge.call_many(system, users))]
+        refs, asrs = list(batch.reference_text), list(batch.asr_output)
+        evals = [evaluate(L, jc, version, pid, raw, rf, a)
+                 for pid, raw, rf, a in zip(batch.pair_id, judge.call_many(system, users), refs, asrs)]
         redo = [i for i, (_, ok, _) in enumerate(evals) if not ok]
         if redo:  # one retry, telling the model what was wrong
-            retry = [users[i] + f"\n\nYour previous answer used labels that aren't in the list ({evals[i][2]}). "
-                     "Answer again with a JSON object using only the listed category names." for i in redo]
+            retry = [users[i] + f"\n\nYour previous answer was not accepted: {evals[i][2]}. Answer again with a "
+                     "JSON object that follows the rules and uses only the listed category names." for i in redo]
             for i, raw in zip(redo, judge.call_many(system, retry)):
-                evals[i] = evaluate(L, jc, version, batch.pair_id.iloc[i], raw)
+                evals[i] = evaluate(L, jc, version, batch.pair_id.iloc[i], raw, refs[i], asrs[i])
+                n_rule_fixed += evals[i][1]
         recs = [e[0] for e in evals]
         write_columns(ctx.sh, "llm_labels", pd.DataFrame(recs).set_index("pair_id"))
         results += recs
@@ -275,6 +306,7 @@ def run(ctx):
 
     res = pd.DataFrame(results)
     res.to_csv(ctx.out_dir / f"judge_labels_{scope}_{version}.csv", index=False)
-    print(f"Done. Invalid labels: {(res.llm_label_valid == 'N').sum()}")
+    print(f"Done. Fixed on retry: {n_rule_fixed} | still invalid (labels or empty-transcript rules): "
+          f"{(res.llm_label_valid == 'N').sum()}")
     show(ctx, "Judge labels (subtype)", res.llm_cat_primary.value_counts().rename("rows")
          .rename_axis("subtype").reset_index())

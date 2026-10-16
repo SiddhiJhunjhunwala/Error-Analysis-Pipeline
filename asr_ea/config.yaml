@@ -1,0 +1,109 @@
+# ASR error analysis: settings for `python run.py`.
+# Command-line flags override two of these: --parts and --scope (see README.md).
+
+# ---------------------------------------------------------------- what to run
+run:
+  # Parts to run, in this order:
+  #   1 build/refresh the pairs and llm_labels tabs   4 LLM judge (see judge.scope)
+  #   2 check manual labels against the categories    5 judge vs manual agreement
+  #   3 dev/test split (once)                         6 results tables
+  parts: [2]
+  output_dir: outputs            # CSV copies of the printed tables, the judge prompt, disagreements
+
+# ---------------------------------------------------------------- the spreadsheet
+sheet:
+  url: "https://docs.google.com/spreadsheets/d/1N0sINtukwwFjMbIAwk1Y2j1McQJkKBfwJgx1beP-UJo/edit"
+  source_tab: "CELaRAI ASRs"     # tab with the ASR outputs (two header rows)
+  manual_tab: "manual_annotation"
+  taxonomy_tab: "error definitions"
+
+google_auth:
+  method: service_account
+  service_account_file: credentials.json
+
+# ---------------------------------------------------------------- Part 1
+part1:
+  overwrite: false               # true deletes and rebuilds all 4 tabs, INCLUDING YOUR MANUAL LABELS
+  sample_size: 250               # only used when the manual tab doesn't exist yet
+  random_seed: 42
+  include_full_story_in_pairs: false
+  suspect_file_ids: []           # flagged in pairs and kept out of a new sample
+  empty_audio_conditions: [empty_audio]
+  # Fix the inferred run setup, keyed by run_key (printed by Part 1), e.g.
+  # config_overrides:
+  #   gpt4o_strict_v2__20260722_112308: {sees_story: "N", sees_question: "Y"}
+  config_overrides: {}
+  # Normalization for WER and has_error. false = lowercase + no punctuation only.
+  # true = also the three settings below, plus teacher speech and __ gaps removed from the reference.
+  extra_normalization: true     # D3 (2026-10-16): formatting-only differences stop counting as errors
+  drop_fillers: true
+  fillers: [um, umm, uhm, uhmm, uh, uhh, er, erm, ah, hm, hmm, hmmm, mm, mmm, mhm, uhum, uhuh, huh, mmhmm]
+  spelling_map: {cause: because, cuz: because, coz: because, cos: because, ok: okay}
+  merge_compounds: true
+
+# ---------------------------------------------------------------- Part 2
+part2:
+  manual_cols:
+    broader: "draft_broader"
+    primary: "draft_primary"
+    secondary: "draft_secondary"
+    meaning: "draft_meaning_changed"
+    notes: "draft_note"
+  label_fixes:
+    "ontopic answer": "On-topic answer"
+    "Stock phrase": "Stock-phrase hallucination"
+  skip_taxonomy_rows: ["proposed additions", "how the drafts were labeled"]
+
+# ---------------------------------------------------------------- Part 3
+part3:
+  dev_size: 50
+  seed: 7
+  resplit: false                 # true redraws the saved split (only before running the test set)
+
+# ---------------------------------------------------------------- Part 4: the judge
+judge:
+  # openai | azure | openai_compatible (a gateway with its own URL) | vllm_server | anthropic
+  provider: openai
+  model: gpt-4o-mini             # API model name; for azure, the deployment name
+  api_key_env: ""                # env var holding the key; empty = the provider's default (see README)
+  base_url: "http://172.22.224.17:4000"                   # openai_compatible / vllm_server, e.g. http://gpu-box:8000/v1
+  azure_endpoint: ""             # azure, e.g. https://<name>.openai.azure.com
+  azure_api_version: "2024-10-21"
+  temperature: 0                 # null for models that don't accept a temperature
+  max_new_tokens: 400
+  guided_json: true              # restrict answers to valid JSON with only your category names
+  qwen_thinking: false           # vllm_server with Qwen3: false skips the <think> step
+
+  scope: dev                     # dev (tune) | test (once) | all (every error row, for Part 6)
+  workers: 8                     # parallel requests; lower it if you hit rate limits
+  batch_size: 100                # rows per batch; results are saved to the sheet after each batch
+  force_relabel: false           # true re-labels rows already labeled with this exact prompt version
+  allow_test_rerun: true         # set 2026-10-16 for one before/after test run; set back to false after
+  max_examples: 10               # prompt examples, taken from dev only
+  few_shot_ids: []               # dev pair_ids to use as examples; empty = one per subtype
+
+  # Rules added to the prompt after the category definitions. Edit to match how you labeled.
+  # Taxonomy rules agreed 2026-10-16 (D1-D7): Hallucination only when the child said nothing;
+  # mishear test for phonetic vs semantic; Y_toward_correct is a flag on any category.
+  labeling_rules: |
+    - Ignore capitalization and punctuation. Text like ("uhm") or Teacher:"..." in the reference is the teacher speaking, not the child.
+    - Apply these checks in order; the first that applies decides the broader category:
+      1. The reference contains the teacher's words or a "Teacher:" label -> "reference issue". Secondary = the ASR's error on the child's part, if any.
+      2. The reference has "__" where the ASR output differs -> "uncertain manual transcript". If the ASR differs only elsewhere, ignore the gap.
+      3. Reference empty (the child said nothing) and ASR not empty -> "Hallucination". Use the first subtype that fits: "Prompt leak", "On-topic answer", "Stock-phrase hallucination", "Filler", "Unrelated fluent speech". Do not use "Background speech"; it needs the audio.
+      4. Reference not empty and ASR empty -> "No output".
+      5. Reference not empty and ASR not empty -> NEVER "Hallucination", even if the ASR output is fluent and unrelated. Label what the ASR did to the child's words.
+    - Phonetic vs semantic: children's speech is unclear, so be generous with "phonetic mapping". If the two words share their main sounds (the same vowel, or the same first or last consonant), it is "phonetic mapping", even when the meaning changes: Sam -> seven, sleep -> three, happy -> hi, pad -> head, ring -> link, their -> there's, fell -> felt, a dad -> a dog. Garbled or foreign-looking spellings of the same sounds are also phonetic. Use "wrong semantic substitution" only when the words share almost no sounds (I don't know -> Ethan, Stan -> Dad, bathing suit -> Thanks).
+    - When the output has a word substitution (phonetic or semantic) AND dropped fillers or repetitions, the substitution is primary and "disfluency removal" is secondary. Dropped fillers are never primary when a word was also changed.
+    - If a filler is in both the reference and the ASR output but spelled differently (uhm -> um, uhh -> Uh, hm -> hmm), that is "formatting only", not "disfluency removal". Use "disfluency removal" only when the filler, repetition or false start is missing from the output.
+    - primary = the error with the biggest effect on meaning. On a tie: wrong semantic substitution > phonetic mapping > content dropped > words added > grammatical correction > disfluency removal > filler/repetition added > formatting only. secondary = the next one, or "".
+    - The category describes what the ASR did; meaning_changed describes the effect. "N" = meaning kept, "Y" = changed, "Y_toward_correct" = the ASR output is closer to the correct answer (according to the story) than what the child said. Use Y_toward_correct with any category.
+
+# ---------------------------------------------------------------- Part 5
+part5:
+  target_kappa: 0.70             # agree on this with Dilek before looking at the test number
+  show_test_disagreements: false
+
+# ---------------------------------------------------------------- Part 6
+part6:
+  results_tab: results
