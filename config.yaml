@@ -1,0 +1,102 @@
+# ASR error analysis: settings for `python run.py`.
+# Command-line flags override two of these: --parts and --scope (see README.md).
+
+# ---------------------------------------------------------------- what to run
+run:
+  # Parts to run, in this order:
+  #   1 build/refresh the pairs and llm_labels tabs   4 LLM judge (see judge.scope)
+  #   2 check manual labels against the categories    5 judge vs manual agreement
+  #   3 dev/test split (once)                         6 results tables
+  parts: [2]
+  output_dir: outputs            # CSV copies of the printed tables, the judge prompt, disagreements
+
+# ---------------------------------------------------------------- the spreadsheet
+sheet:
+  url: "https://docs.google.com/spreadsheets/d/1N0sINtukwwFjMbIAwk1Y2j1McQJkKBfwJgx1beP-UJo/edit"
+  source_tab: "CELaRAI ASRs"     # tab with the ASR outputs (two header rows)
+  manual_tab: "manual_annotation"
+  taxonomy_tab: "error definitions"
+
+google_auth:
+  method: service_account
+  service_account_file: credentials.json
+
+# ---------------------------------------------------------------- Part 1
+part1:
+  overwrite: false               # true deletes and rebuilds all 4 tabs, INCLUDING YOUR MANUAL LABELS
+  sample_size: 250               # only used when the manual tab doesn't exist yet
+  random_seed: 42
+  include_full_story_in_pairs: false
+  suspect_file_ids: []           # flagged in pairs and kept out of a new sample
+  empty_audio_conditions: [empty_audio]
+  # Fix the inferred run setup, keyed by run_key (printed by Part 1), e.g.
+  # config_overrides:
+  #   gpt4o_strict_v2__20260722_112308: {sees_story: "N", sees_question: "Y"}
+  config_overrides: {}
+  # Normalization for WER and has_error. false = lowercase + no punctuation only.
+  # true = also the three settings below, plus teacher speech and __ gaps removed from the reference.
+  extra_normalization: false
+  drop_fillers: true
+  fillers: [um, umm, uhm, uhmm, uh, uhh, er, erm, ah, hm, hmm, hmmm, mm, mmm, mhm, uhum, uhuh, huh, mmhmm]
+  spelling_map: {cause: because, cuz: because, coz: because, cos: because, ok: okay}
+  merge_compounds: true
+
+# ---------------------------------------------------------------- Part 2
+part2:
+  manual_cols:
+    broader: "draft_broader"
+    primary: "draft_primary"
+    secondary: "draft_secondary"
+    meaning: "draft_meaning_changed"
+    notes: "draft_note"
+  label_fixes:
+    "ontopic answer": "On-topic answer"
+    "Stock phrase": "Stock-phrase hallucination"
+  skip_taxonomy_rows: ["proposed additions", "how the drafts were labeled"]
+
+# ---------------------------------------------------------------- Part 3
+part3:
+  dev_size: 50
+  seed: 7
+  resplit: false                 # true redraws the saved split (only before running the test set)
+
+# ---------------------------------------------------------------- Part 4: the judge
+judge:
+  # openai | azure | openai_compatible (a gateway with its own URL) | vllm_server | anthropic
+  provider: openai
+  model: gpt-4o-mini             # API model name; for azure, the deployment name
+  api_key_env: ""                # env var holding the key; empty = the provider's default (see README)
+  base_url: "http://172.22.224.17:4000"                   # openai_compatible / vllm_server, e.g. http://gpu-box:8000/v1
+  azure_endpoint: ""             # azure, e.g. https://<name>.openai.azure.com
+  azure_api_version: "2024-10-21"
+  temperature: 0                 # null for models that don't accept a temperature
+  max_new_tokens: 400
+  guided_json: true              # restrict answers to valid JSON with only your category names
+  qwen_thinking: false           # vllm_server with Qwen3: false skips the <think> step
+
+  scope: dev                     # dev (tune) | test (once) | all (every error row, for Part 6)
+  workers: 8                     # parallel requests; lower it if you hit rate limits
+  batch_size: 100                # rows per batch; results are saved to the sheet after each batch
+  force_relabel: false           # true re-labels rows already labeled with this exact prompt version
+  allow_test_rerun: false
+  max_examples: 10               # prompt examples, taken from dev only
+  few_shot_ids: []               # dev pair_ids to use as examples; empty = one per subtype
+
+  # Rules added to the prompt after the category definitions. Edit to match how you labeled.
+  labeling_rules: |
+    - Compare the ASR output with the reference transcript. Ignore capitalization and punctuation.
+    - primary = the error with the biggest effect on meaning; secondary = the next most important one, or "" if there is only one.
+    - The category describes the cause; meaning_changed describes the effect. A sound-alike slip that changes the answer is still a phonetic error, with meaning_changed = "Y".
+    - meaning_changed: "N" if the meaning is kept, "Y" if it changed, "Y_toward_correct" if the ASR output is closer to the correct answer to the question (according to the story) than what the child said.
+    - "__" in the reference marks words the transcriber couldn't hear. If the gap matters for the comparison, use the broader category "uncertain manual transcript".
+    - Text like ("uhm") or Teacher:"..." in the reference is the teacher speaking, not the child.
+    - If the ASR output is empty but the reference isn't, use "No output".
+
+# ---------------------------------------------------------------- Part 5
+part5:
+  target_kappa: 0.70             # agree on this with Dilek before looking at the test number
+  show_test_disagreements: false
+
+# ---------------------------------------------------------------- Part 6
+part6:
+  results_tab: results
